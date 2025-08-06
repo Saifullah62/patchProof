@@ -168,6 +168,80 @@ This project includes a ready-to-use GitHub Actions workflow for continuous inte
 - OpenAPI/Swagger docs available at [`/docs`](http://localhost:3000/docs) when running the server.
 - See `openapi.yaml` for full endpoint specs.
 
+### Verification Endpoint with Merkle Proof
+
+`GET /verify/:txid`
+
+Returns:
+```json
+{
+  "txid": "...",
+  "validHash": true,
+  "validSig": true,
+  "merkleProofValid": true
+}
+```
+- `merkleProofValid` is `true` if the record's hash, Merkle path, and Merkle root together prove inclusion in the batch anchor.
+- If the record was not batch anchored, `merkleProofValid` will be `null`.
+
+---
+
+## 🔐 Advanced Cryptographic Utilities
+
+PatchProof™ uses a modern, production-grade cryptographic toolkit in [`keyUtils.js`](./keyUtils.js) to ensure all authentication and chain-of-custody operations are secure, auditable, and standards-compliant (WP0042 / EP3268914B1).
+
+### Key Features
+- **Hierarchical Deterministic Key Derivation:**
+  - `deriveKeyFromMessage(message, depth)` – Deterministically derives a BSV key pair from any message (e.g., user ID, record ID). Supports optional hierarchy (depth).
+  - `deriveEphemeralSessionKey(userId, label)` – Generates a single-use/session key with timestamp entropy for login, claim, or transfer flows.
+  - `deriveKeyTree(baseMessage, paths)` – Derives a tree of subkeys for multi-branch workflows.
+- **Digital Signatures:**
+  - `signHash(hash, keyPair)` – Signs a SHA256 hash with a BSV key pair (returns base64 signature).
+  - `verifyHashSignature(hash, signature, pubKeyStr)` – Verifies a signature against a hash and public key.
+- **Canonical Object Hashing:**
+  - `computeSha256(obj)` – Computes a SHA256 hash of an object using canonical JSON serialization (field order independent).
+- **Merkle Batching:**
+  - `computeMerkleRoot(hashes)` – Computes a Merkle root from an array of SHA256 hashes (for batch anchoring or multi-record proofs).
+- **Merkle Proof Validation:**
+  - `verifyMerkleProof(leaf, path, root)` – Verifies a Merkle inclusion proof for a record in a batch anchor (used in verification endpoints).
+
+### Example Usage
+```js
+const {
+  deriveKeyFromMessage,
+  deriveEphemeralSessionKey,
+  computeMerkleRoot,
+  signHash,
+  verifyHashSignature,
+  computeSha256,
+  deriveKeyTree
+} = require('./keyUtils');
+
+// Deterministic user key
+type KeyPair = deriveKeyFromMessage('user@example.com');
+
+// Ephemeral session key
+const sessionKey = deriveEphemeralSessionKey('user@example.com', 'login');
+
+// Sign and verify
+const hash = computeSha256({ some: 'object' });
+const sig = signHash(hash, sessionKey);
+const valid = verifyHashSignature(hash, sig, sessionKey.pubKey.toString());
+
+// Merkle batching
+const hashes = [computeSha256({a:1}), computeSha256({b:2})];
+const root = computeMerkleRoot(hashes);
+```
+
+### Security Notes
+- **No private keys are ever stored**: All keys are derived on demand from a master secret (see `secrets.js`).
+- **Session/ephemeral keys** are unique per login/claim/transfer and cannot be reused.
+- **Canonical hashing** ensures object hashes are stable regardless of field order.
+- **All cryptographic operations** use industry-standard primitives (SHA256, ECDSA, HMAC).
+- **Ready for Merkle batching**: Enables scalable, auditable batch anchoring for high-throughput use cases.
+
+See [`tests/keyUtils.test.js`](./tests/keyUtils.test.js) for full test coverage and usage patterns.
+
 ---
 
 ## 💸 Funding Abstraction & Extensibility

@@ -6,8 +6,15 @@ const morgan = require('morgan');
 const axios = require('axios');
 const Joi = require('joi');
 const winston = require('winston');
-const bsv = require('bsv');
-const crypto = require('crypto');
+const {
+  deriveKeyFromMessage,
+  deriveEphemeralSessionKey,
+  computeMerkleRoot,
+  signHash,
+  verifyHashSignature,
+  computeSha256,
+  deriveKeyTree
+} = require('./keyUtils');
 const { getSecret } = require('./secrets');
 // DB_TYPE controls which SQL backend is used: 'sqlite' (default), 'postgres', or 'mysql'.
 // See db.js for details. Set DB_TYPE and DB_FILE/DB_URL in your environment.
@@ -27,25 +34,8 @@ const { initDb, saveRecord, getRecord } = require('./db');
  */
 
 // ---------------------------------------------------------------------------
-// Deterministic key derivation
-//
-// The master secret used to derive per‑user keys.  In production this
-// should be supplied via a secrets manager and not hard‑coded.  When a
-// user claims an item the server derives a key from their identifier and
-// optional second factor and index.  No private keys are stored.
-const MASTER_SECRET = getSecret('MASTER_SECRET') || 'demo-master-secret';
-
-function deriveKeyPair(userId, secondFactor = '', index = 0) {
-  const hmac = crypto.createHmac('sha256', MASTER_SECRET);
-  hmac.update(String(userId));
-  if (secondFactor) {
-    hmac.update(String(secondFactor));
-  }
-  const seed = hmac.digest();
-  const bip32 = new bsv.Bip32().fromSeed(seed).deriveChild(index);
-  const privKey = bip32.privKey;
-  return new bsv.KeyPair().fromPrivKey(privKey);
-}
+// Deterministic key derivation now handled by keyUtils.js
+// Use deriveKeyFromMessage or deriveEphemeralSessionKey as needed.
 
 // ---------------------------------------------------------------------------
 // SQL persistence (multi-database via db.js)
@@ -117,32 +107,12 @@ const authRecordSchema = Joi.object({
 }).unknown(false);
 
 // ---------------------------------------------------------------------------
-// Cryptographic helpers
-//
-function computeSha256(obj) {
-  const jsonString = JSON.stringify(obj);
-  const hash = crypto.createHash('sha256');
-  hash.update(jsonString);
-  return hash.digest();
-}
+// Cryptographic helpers now handled by keyUtils.js
+// Use computeSha256, signHash, verifyHashSignature from keyUtils.js
 
 function computeTxid(buf) {
   const txHash = bsv.Hash.sha256Sha256(buf);
   return Buffer.from(txHash).reverse().toString('hex');
-}
-
-function signHashWithKey(hashBuf, keyPair) {
-  const sig = bsv.Ecdsa.sign(hashBuf, keyPair);
-  return sig.toString();
-}
-
-function verifySignature(hashBuf, signatureStr, pubKey) {
-  try {
-    const sig = bsv.Sig.fromString(signatureStr);
-    return bsv.Ecdsa.verify(hashBuf, sig, pubKey);
-  } catch (err) {
-    return false;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -575,9 +545,9 @@ app.post('/transfer/accept', async (req, res) => {
   }
   // Verify current holder's signature
   const intentHashBuf = Buffer.from(transferRequest.intentHash, 'hex');
-  const fromKeyPair = deriveKeyPair(transferRequest.from, '', 0);
-  const fromPubKey = fromKeyPair.pubKey;
-  if (!verifySignature(intentHashBuf, transferRequest.fromSig, fromPubKey)) {
+  const fromKeyPair = deriveKeyFromMessage(`${transferRequest.from}/ownership`);
+  const fromPubKey = fromKeyPair.pubKey.toString();
+  if (!verifyHashSignature(intentHashBuf, transferRequest.fromSig, fromPubKey)) {
     return res.status(400).json({ error: { message: 'Invalid signature from current holder', requestId: req.requestId || null } });
   }
   // New holder signs acceptance
@@ -586,8 +556,8 @@ app.post('/transfer/accept', async (req, res) => {
     acceptanceTimestamp: new Date().toISOString(),
   };
   const acceptanceHash = computeSha256(acceptance);
-  const newKeyPair = deriveKeyPair(newHolder, passphrase, 0);
-  const toSig = signHashWithKey(acceptanceHash, newKeyPair);
+  const newKeyPair = deriveKeyFromMessage(`${newHolder}/ownership` + (passphrase || ''));
+  const toSig = signHash(acceptanceHash, newKeyPair);
   // Update record
   const record = await getRecord(txid);
   if (!record) {
@@ -642,10 +612,22 @@ app.get('/verify/:txid', async (req, res) => {
     const hashBuf = computeSha256(clone);
     const expectedHash = record.auth.sha256_hash;
     const signature = record.auth.signature;
-    const pubKeyObj = bsv.PubKey.fromString(record.auth.pubKey);
+    const pubKeyStr = record.auth.pubKey;
     const validHash = hashBuf.toString('hex') === expectedHash;
-    const validSig = verifySignature(hashBuf, signature, pubKeyObj);
-    return res.json({ txid, validHash, validSig });
+    const validSig = verifyHashSignature(hashBuf, signature, pubKeyStr);
+    // Merkle proof validation
+    let merkleProofValid = null;
+    if (record.auth && record.auth.merkleRoot && record.auth.merklePath) {
+      try {
+        const leaf = hashBuf;
+        const root = Buffer.from(record.auth.merkleRoot, 'hex');
+        const path = record.auth.merklePath.map(p => Buffer.from(p, 'hex'));
+        merkleProofValid = require('./keyUtils').verifyMerkleProof(leaf, path, root);
+      } catch (e) {
+        merkleProofValid = false;
+      }
+    }
+    return res.json({ txid, validHash, validSig, merkleProofValid });
   } catch (err) {
     logger.error({ message: 'Verification error', error: err.message });
     return res.status(500).json({ error: { message: 'Verification failed', requestId: req.requestId || null } });
